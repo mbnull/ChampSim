@@ -17,102 +17,121 @@
 /*
  * ChampSim Tracer QEMU Plugin for RISC-V
  *
- * This plugin generates ChampSim-compatible traces for RV32I/RV64I programs.
- *
  * Usage (bare-metal):
- *   qemu-system-riscv32 -M virt -nographic -kernel program.elf -plugin /path/to/libchampsim_tracer.so,arg="output=trace.bin,skip=0,count=1000000"
- *   qemu-system-riscv64 -M virt -nographic -kernel program.elf -plugin /path/to/libchampsim_tracer.so,arg="output=trace.bin,skip=0,count=1000000"
+ *   qemu-system-riscv32 -M virt -nographic -kernel program.elf \
+ *     -plugin /path/to/libchampsim_tracer.so,arg="output=trace.bin,skip=0,count=1000000"
+ *   qemu-system-riscv64 -M virt -nographic -kernel program.elf \
+ *     -plugin /path/to/libchampsim_tracer.so,arg="output=trace.bin,skip=0,count=1000000"
  *
- * Usage (Linux binaries):
- *   qemu-riscv32 -plugin /path/to/libchampsim_tracer.so,arg="output=trace.bin,skip=0,count=1000000" program.elf
- *   qemu-riscv64 -plugin /path/to/libchampsim_tracer.so,arg="output=trace.bin,skip=0,count=1000000" program.elf
+ * Debug text dump:
+ *   Add arg="debug=trace.txt" to also write a human-readable text file.
+ *
+ * Design note on memory callbacks:
+ *   Each instruction gets a heap-allocated trace_instr_format_t pre-filled at
+ *   translation time. All three callbacks (exec, mem, exec_after) receive the
+ *   same pointer via userdata, so mem callbacks always write into the correct
+ *   struct regardless of which host thread fires them.
  */
 
-#include <assert.h>
 #include <glib.h>
 #include <inttypes.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
 
 #include <qemu-plugin.h>
 
 QEMU_PLUGIN_EXPORT int qemu_plugin_version = QEMU_PLUGIN_VERSION;
 
-/* Trace instruction format matching ChampSim's input_instr */
 #define NUM_INSTR_DESTINATIONS 2
-#define NUM_INSTR_SOURCES 4
+#define NUM_INSTR_SOURCES      4
 
 typedef struct {
-    uint64_t ip;                                        // instruction pointer
-    uint8_t is_branch;                                  // is this a branch?
-    uint8_t branch_taken;                               // was the branch taken?
-    uint8_t destination_registers[NUM_INSTR_DESTINATIONS]; // output registers
-    uint8_t source_registers[NUM_INSTR_SOURCES];        // input registers
-    uint64_t destination_memory[NUM_INSTR_DESTINATIONS]; // output memory addresses
-    uint64_t source_memory[NUM_INSTR_SOURCES];          // input memory addresses
+    uint64_t ip;
+    uint8_t  is_branch;
+    uint8_t  branch_taken;
+    uint8_t  destination_registers[NUM_INSTR_DESTINATIONS];
+    uint8_t  source_registers[NUM_INSTR_SOURCES];
+    uint64_t destination_memory[NUM_INSTR_DESTINATIONS];
+    uint64_t source_memory[NUM_INSTR_SOURCES];
 } trace_instr_format_t;
 
+/*
+ * Per-instruction execution context.
+ * Allocated once at translation time, shared by all callbacks for that insn.
+ * is_conditional is not part of the trace format — it's used only to resolve
+ * branch_taken at runtime.
+ */
+typedef struct {
+    trace_instr_format_t instr;
+    uint8_t              is_conditional;
+} insn_ctx_t;
+
 /* Global state */
-static FILE *trace_file = NULL;
+static FILE    *trace_file = NULL;
+static FILE    *debug_file = NULL;
 static uint64_t instr_count = 0;
-static uint64_t skip_count = 0;
+static uint64_t skip_count  = 0;
 static uint64_t trace_count = 1000000;
-static char *output_filename = NULL;
-static GMutex lock;
+static GMutex   lock;
 
-/* Current instruction being traced */
-static __thread trace_instr_format_t curr_instr;
+/*
+ * Per-vCPU pending state.
+ * pending_ctx points to the heap-allocated ctx of the previous instruction.
+ * It is flushed at the start of the NEXT vcpu_insn_exec, by which time all
+ * mem callbacks for that instruction have already written their addresses in.
+ *
+ * NOTE: we register vcpu_insn_exec_cb only ONCE per instruction.
+ * QEMU 10 silently drops a second registration on the same insn, so the
+ * old "exec + exec_after" pattern no longer works. Instead we flush the
+ * previous ctx at the top of the current exec callback.
+ */
+static __thread insn_ctx_t *pending_ctx     = NULL;
+static __thread uint64_t    pending_next_pc = 0;
 
-/* RISC-V register mapping to ChampSim format */
+/* ------------------------------------------------------------------ */
+
 static inline uint8_t map_riscv_reg(int reg) {
-    /* RISC-V has 32 integer registers (x0-x31)
-     * We map them directly to 0-31 for ChampSim */
-    if (reg >= 0 && reg < 32) {
-        return (uint8_t)reg;
-    }
-    return 0; // x0 (zero register) for invalid
+    return (reg >= 0 && reg < 32) ? (uint8_t)reg : 0;
 }
 
-/* Add register to the set if not already present */
-static void add_reg_to_set(uint8_t *reg_array, size_t array_size, uint8_t reg) {
-    if (reg == 0) return; // Skip zero register
-
-    for (size_t i = 0; i < array_size; i++) {
-        if (reg_array[i] == 0) {
-            reg_array[i] = reg;
-            return;
-        }
-        if (reg_array[i] == reg) {
-            return; // Already in set
-        }
+static void add_reg(uint8_t *arr, size_t n, uint8_t reg) {
+    if (reg == 0) return;
+    for (size_t i = 0; i < n; i++) {
+        if (arr[i] == 0) { arr[i] = reg; return; }
+        if (arr[i] == reg) return;
     }
 }
 
-/* Add memory address to the set if not already present */
-static void add_mem_to_set(uint64_t *mem_array, size_t array_size, uint64_t addr) {
+static void add_mem(uint64_t *arr, size_t n, uint64_t addr) {
     if (addr == 0) return;
-
-    for (size_t i = 0; i < array_size; i++) {
-        if (mem_array[i] == 0) {
-            mem_array[i] = addr;
-            return;
-        }
-        if (mem_array[i] == addr) {
-            return; // Already in set
-        }
+    for (size_t i = 0; i < n; i++) {
+        if (arr[i] == 0) { arr[i] = addr; return; }
+        if (arr[i] == addr) return;
     }
 }
 
-/* Reset current instruction */
-static void reset_curr_instr(uint64_t pc) {
-    memset(&curr_instr, 0, sizeof(curr_instr));
-    curr_instr.ip = pc;
+/* ------------------------------------------------------------------ */
+
+static void write_debug_line(const trace_instr_format_t *t) {
+    fprintf(debug_file,
+            "ip=0x%016" PRIx64
+            " branch=%d taken=%d"
+            " dst_regs=[%02d,%02d]"
+            " src_regs=[%02d,%02d,%02d,%02d]"
+            " dst_mem=[0x%08" PRIx64 ",0x%08" PRIx64 "]"
+            " src_mem=[0x%08" PRIx64 ",0x%08" PRIx64 ",0x%08" PRIx64 ",0x%08" PRIx64 "]\n",
+            t->ip, t->is_branch, t->branch_taken,
+            t->destination_registers[0], t->destination_registers[1],
+            t->source_registers[0], t->source_registers[1],
+            t->source_registers[2], t->source_registers[3],
+            t->destination_memory[0], t->destination_memory[1],
+            t->source_memory[0], t->source_memory[1],
+            t->source_memory[2], t->source_memory[3]);
 }
 
-/* Write current instruction to trace file */
-static void write_curr_instr(void) {
+static void flush_instr(const trace_instr_format_t *t) {
     g_mutex_lock(&lock);
 
     instr_count++;
@@ -120,195 +139,212 @@ static void write_curr_instr(void) {
     if (instr_count > skip_count &&
         instr_count <= (skip_count + trace_count)) {
 
-        if (trace_file) {
-            fwrite(&curr_instr, sizeof(trace_instr_format_t), 1, trace_file);
-        }
+        if (trace_file)
+            fwrite(t, sizeof(trace_instr_format_t), 1, trace_file);
+        if (debug_file)
+            write_debug_line(t);
 
-        /* Print progress every 100k instructions */
         if ((instr_count - skip_count) % 100000 == 0) {
-            qemu_plugin_outs("Traced ");
-            g_autofree gchar *out = g_strdup_printf("%" PRIu64 " instructions\n",
-                                                     instr_count - skip_count);
-            qemu_plugin_outs(out);
+            g_autofree gchar *msg = g_strdup_printf(
+                "Traced %" PRIu64 " instructions\n", instr_count - skip_count);
+            qemu_plugin_outs(msg);
         }
     }
 
-    /* Stop tracing if we've reached the limit */
     if (instr_count >= (skip_count + trace_count)) {
-        if (trace_file) {
-            fclose(trace_file);
-            trace_file = NULL;
-        }
+        if (trace_file) { fclose(trace_file); trace_file = NULL; }
+        if (debug_file) { fclose(debug_file); debug_file = NULL; }
         qemu_plugin_outs("Tracing complete!\n");
     }
 
     g_mutex_unlock(&lock);
 }
 
-/* Callback for instruction execution */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Single exec callback per instruction.
+ * Flushes the PREVIOUS instruction (mem callbacks have already run for it),
+ * then resets the current ctx ready for this instruction's mem callbacks.
+ */
 static void vcpu_insn_exec(unsigned int vcpu_index, void *userdata) {
-    uint64_t pc = (uint64_t)userdata;
-    reset_curr_instr(pc);
+    insn_ctx_t *ctx = (insn_ctx_t *)userdata;
+
+    if (pending_ctx) {
+        if (pending_ctx->is_conditional)
+            pending_ctx->instr.branch_taken =
+                (ctx->instr.ip != pending_next_pc) ? 1 : 0;
+        flush_instr(&pending_ctx->instr);
+    }
+
+    /* Reset only the runtime fields; registers were pre-filled at translation */
+    memset(ctx->instr.destination_memory, 0, sizeof(ctx->instr.destination_memory));
+    memset(ctx->instr.source_memory,      0, sizeof(ctx->instr.source_memory));
+    ctx->instr.branch_taken = ctx->instr.is_branch && !pending_ctx ? 0 : ctx->instr.branch_taken;
+    /* For unconditional branches branch_taken was set at translation time;
+     * for conditional branches it will be resolved when the next insn runs. */
+    if (!ctx->is_conditional && ctx->instr.is_branch)
+        ctx->instr.branch_taken = 1;
+    else if (ctx->is_conditional)
+        ctx->instr.branch_taken = 0;
+
+    pending_ctx     = ctx;
+    pending_next_pc = ctx->instr.ip + 4;
 }
 
-/* Callback for memory read */
+
+/* mem callbacks receive the same insn_ctx_t* as userdata */
 static void vcpu_mem_read(unsigned int vcpu_index, qemu_plugin_meminfo_t info,
                           uint64_t vaddr, void *userdata) {
-    add_mem_to_set(curr_instr.source_memory, NUM_INSTR_SOURCES, vaddr);
+    insn_ctx_t *ctx = (insn_ctx_t *)userdata;
+    add_mem(ctx->instr.source_memory, NUM_INSTR_SOURCES, vaddr);
 }
 
-/* Callback for memory write */
 static void vcpu_mem_write(unsigned int vcpu_index, qemu_plugin_meminfo_t info,
                            uint64_t vaddr, void *userdata) {
-    add_mem_to_set(curr_instr.destination_memory, NUM_INSTR_DESTINATIONS, vaddr);
+    insn_ctx_t *ctx = (insn_ctx_t *)userdata;
+    add_mem(ctx->instr.destination_memory, NUM_INSTR_DESTINATIONS, vaddr);
 }
 
-/* Callback after instruction execution */
-static void vcpu_insn_exec_after(unsigned int vcpu_index, void *userdata) {
-    write_curr_instr();
+/* ------------------------------------------------------------------ */
+
+static insn_ctx_t *build_insn_ctx(uint64_t pc, uint32_t insn_word) {
+    insn_ctx_t *ctx = g_new0(insn_ctx_t, 1);
+    ctx->instr.ip   = pc;
+
+    uint32_t opcode = insn_word & 0x7F;
+    uint32_t rd     = (insn_word >> 7)  & 0x1F;
+    uint32_t rs1    = (insn_word >> 15) & 0x1F;
+    uint32_t rs2    = (insn_word >> 20) & 0x1F;
+
+    if (opcode == 0x63) { /* B-type: conditional branch */
+        ctx->instr.is_branch  = 1;
+        ctx->is_conditional   = 1;
+        add_reg(ctx->instr.source_registers, NUM_INSTR_SOURCES, map_riscv_reg(rs1));
+        add_reg(ctx->instr.source_registers, NUM_INSTR_SOURCES, map_riscv_reg(rs2));
+    } else if (opcode == 0x6F) { /* JAL */
+        ctx->instr.is_branch   = 1;
+        ctx->instr.branch_taken = 1;
+        if (rd) add_reg(ctx->instr.destination_registers, NUM_INSTR_DESTINATIONS, map_riscv_reg(rd));
+    } else if (opcode == 0x67) { /* JALR */
+        ctx->instr.is_branch   = 1;
+        ctx->instr.branch_taken = 1;
+        add_reg(ctx->instr.source_registers, NUM_INSTR_SOURCES, map_riscv_reg(rs1));
+        if (rd) add_reg(ctx->instr.destination_registers, NUM_INSTR_DESTINATIONS, map_riscv_reg(rd));
+    } else if (opcode == 0x33 || opcode == 0x3B) { /* R-type */
+        add_reg(ctx->instr.source_registers, NUM_INSTR_SOURCES, map_riscv_reg(rs1));
+        add_reg(ctx->instr.source_registers, NUM_INSTR_SOURCES, map_riscv_reg(rs2));
+        if (rd) add_reg(ctx->instr.destination_registers, NUM_INSTR_DESTINATIONS, map_riscv_reg(rd));
+    } else if (opcode == 0x13 || opcode == 0x1B || opcode == 0x03 || opcode == 0x73) { /* I-type */
+        add_reg(ctx->instr.source_registers, NUM_INSTR_SOURCES, map_riscv_reg(rs1));
+        if (rd) add_reg(ctx->instr.destination_registers, NUM_INSTR_DESTINATIONS, map_riscv_reg(rd));
+    } else if (opcode == 0x23) { /* S-type */
+        add_reg(ctx->instr.source_registers, NUM_INSTR_SOURCES, map_riscv_reg(rs1));
+        add_reg(ctx->instr.source_registers, NUM_INSTR_SOURCES, map_riscv_reg(rs2));
+    } else if (opcode == 0x37 || opcode == 0x17) { /* U-type */
+        if (rd) add_reg(ctx->instr.destination_registers, NUM_INSTR_DESTINATIONS, map_riscv_reg(rd));
+    }
+
+    return ctx;
 }
 
-/* Parse RISC-V instruction to extract register operands */
-static void parse_riscv_insn(uint32_t insn, uint64_t pc) {
-    uint32_t opcode = insn & 0x7F;
-    uint32_t rd = (insn >> 7) & 0x1F;
-    uint32_t rs1 = (insn >> 15) & 0x1F;
-    uint32_t rs2 = (insn >> 20) & 0x1F;
-    uint32_t funct3 = (insn >> 12) & 0x7;
-
-    /* Detect branches */
-    if (opcode == 0x63) { // Branch instructions
-        curr_instr.is_branch = 1;
-        add_reg_to_set(curr_instr.source_registers, NUM_INSTR_SOURCES, map_riscv_reg(rs1));
-        add_reg_to_set(curr_instr.source_registers, NUM_INSTR_SOURCES, map_riscv_reg(rs2));
-    }
-    /* JAL */
-    else if (opcode == 0x6F) {
-        curr_instr.is_branch = 1;
-        curr_instr.branch_taken = 1;
-        if (rd != 0) {
-            add_reg_to_set(curr_instr.destination_registers, NUM_INSTR_DESTINATIONS, map_riscv_reg(rd));
-        }
-    }
-    /* JALR */
-    else if (opcode == 0x67) {
-        curr_instr.is_branch = 1;
-        curr_instr.branch_taken = 1;
-        add_reg_to_set(curr_instr.source_registers, NUM_INSTR_SOURCES, map_riscv_reg(rs1));
-        if (rd != 0) {
-            add_reg_to_set(curr_instr.destination_registers, NUM_INSTR_DESTINATIONS, map_riscv_reg(rd));
-        }
-    }
-    /* R-type instructions */
-    else if (opcode == 0x33 || opcode == 0x3B) {
-        add_reg_to_set(curr_instr.source_registers, NUM_INSTR_SOURCES, map_riscv_reg(rs1));
-        add_reg_to_set(curr_instr.source_registers, NUM_INSTR_SOURCES, map_riscv_reg(rs2));
-        if (rd != 0) {
-            add_reg_to_set(curr_instr.destination_registers, NUM_INSTR_DESTINATIONS, map_riscv_reg(rd));
-        }
-    }
-    /* I-type instructions (including loads) */
-    else if (opcode == 0x13 || opcode == 0x1B || opcode == 0x03 || opcode == 0x73) {
-        add_reg_to_set(curr_instr.source_registers, NUM_INSTR_SOURCES, map_riscv_reg(rs1));
-        if (rd != 0) {
-            add_reg_to_set(curr_instr.destination_registers, NUM_INSTR_DESTINATIONS, map_riscv_reg(rd));
-        }
-    }
-    /* S-type instructions (stores) */
-    else if (opcode == 0x23) {
-        add_reg_to_set(curr_instr.source_registers, NUM_INSTR_SOURCES, map_riscv_reg(rs1));
-        add_reg_to_set(curr_instr.source_registers, NUM_INSTR_SOURCES, map_riscv_reg(rs2));
-    }
-    /* U-type instructions (LUI, AUIPC) */
-    else if (opcode == 0x37 || opcode == 0x17) {
-        if (rd != 0) {
-            add_reg_to_set(curr_instr.destination_registers, NUM_INSTR_DESTINATIONS, map_riscv_reg(rd));
-        }
-    }
-}
-
-/* Callback for instruction translation */
 static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb) {
-    size_t n_insns = qemu_plugin_tb_n_insns(tb);
+    size_t n = qemu_plugin_tb_n_insns(tb);
 
-    for (size_t i = 0; i < n_insns; i++) {
+    for (size_t i = 0; i < n; i++) {
         struct qemu_plugin_insn *insn = qemu_plugin_tb_get_insn(tb, i);
         uint64_t pc = qemu_plugin_insn_vaddr(insn);
 
-        /* Register callback before instruction execution */
-        qemu_plugin_register_vcpu_insn_exec_cb(insn, vcpu_insn_exec,
-                                               QEMU_PLUGIN_CB_NO_REGS,
-                                               (void *)pc);
-
-        /* Parse instruction for register operands */
+        insn_ctx_t *ctx = NULL;
         size_t insn_size = qemu_plugin_insn_size(insn);
-        const uint8_t *insn_data = (const uint8_t *)qemu_plugin_insn_data(insn);
-
         if (insn_size == 4) {
-            uint32_t insn_word = *(uint32_t *)insn_data;
-            parse_riscv_insn(insn_word, pc);
+            uint8_t buf[4];
+            qemu_plugin_insn_data(insn, buf, 4);
+            uint32_t word = *(uint32_t *)buf;
+            ctx = build_insn_ctx(pc, word);
+        } else {
+            /* Compressed (2-byte) or unknown — minimal ctx */
+            ctx = g_new0(insn_ctx_t, 1);
+            ctx->instr.ip = pc;
         }
 
-        /* Register memory callbacks */
+        /* All callbacks share the same ctx pointer.
+         * Only ONE vcpu_insn_exec_cb is registered — QEMU 10 drops duplicates. */
+        qemu_plugin_register_vcpu_insn_exec_cb(insn, vcpu_insn_exec,
+                                               QEMU_PLUGIN_CB_NO_REGS, ctx);
         qemu_plugin_register_vcpu_mem_cb(insn, vcpu_mem_read,
                                          QEMU_PLUGIN_CB_NO_REGS,
-                                         QEMU_PLUGIN_MEM_R, NULL);
+                                         QEMU_PLUGIN_MEM_R, ctx);
         qemu_plugin_register_vcpu_mem_cb(insn, vcpu_mem_write,
                                          QEMU_PLUGIN_CB_NO_REGS,
-                                         QEMU_PLUGIN_MEM_W, NULL);
-
-        /* Register callback after instruction execution */
-        qemu_plugin_register_vcpu_insn_exec_cb(insn, vcpu_insn_exec_after,
-                                               QEMU_PLUGIN_CB_NO_REGS, NULL);
+                                         QEMU_PLUGIN_MEM_W, ctx);
     }
 }
 
-/* Plugin initialization */
+/* ------------------------------------------------------------------ */
+
+static void plugin_exit(qemu_plugin_id_t id, void *p) {
+    if (pending_ctx) {
+        flush_instr(&pending_ctx->instr);
+        pending_ctx = NULL;
+    }
+    if (trace_file) { fclose(trace_file); trace_file = NULL; }
+    if (debug_file) { fclose(debug_file); debug_file = NULL; }
+}
+
 QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id,
                                            const qemu_info_t *info,
                                            int argc, char **argv) {
-    /* Parse arguments */
-    for (int i = 0; i < argc; i++) {
-        char *opt = argv[i];
-        g_auto(GStrv) tokens = g_strsplit(opt, "=", 2);
+    char *output_filename = NULL;
+    char *debug_filename  = NULL;
 
-        if (g_strcmp0(tokens[0], "output") == 0) {
-            output_filename = g_strdup(tokens[1]);
-        } else if (g_strcmp0(tokens[0], "skip") == 0) {
-            skip_count = g_ascii_strtoull(tokens[1], NULL, 10);
-        } else if (g_strcmp0(tokens[0], "count") == 0) {
-            trace_count = g_ascii_strtoull(tokens[1], NULL, 10);
-        } else {
-            fprintf(stderr, "Unknown option: %s\n", tokens[0]);
+    for (int i = 0; i < argc; i++) {
+        g_auto(GStrv) tok = g_strsplit(argv[i], "=", 2);
+        if      (g_strcmp0(tok[0], "output") == 0) output_filename = g_strdup(tok[1]);
+        else if (g_strcmp0(tok[0], "skip")   == 0) skip_count  = g_ascii_strtoull(tok[1], NULL, 10);
+        else if (g_strcmp0(tok[0], "count")  == 0) trace_count = g_ascii_strtoull(tok[1], NULL, 10);
+        else if (g_strcmp0(tok[0], "debug")  == 0) debug_filename = g_strdup(tok[1]);
+        else {
+            fprintf(stderr, "Unknown option: %s\n", tok[0]);
             return -1;
         }
     }
 
-    /* Set default output filename if not specified */
-    if (!output_filename) {
+    if (!output_filename)
         output_filename = g_strdup("champsim.trace");
-    }
 
-    /* Open trace file */
     trace_file = fopen(output_filename, "wb");
     if (!trace_file) {
         fprintf(stderr, "Failed to open trace file: %s\n", output_filename);
         return -1;
     }
 
+    if (debug_filename) {
+        debug_file = fopen(debug_filename, "w");
+        if (!debug_file) {
+            fprintf(stderr, "Failed to open debug file: %s\n", debug_filename);
+            return -1;
+        }
+        fprintf(debug_file,
+                "# ip branch taken dst_regs[0,1] src_regs[0,1,2,3] "
+                "dst_mem[0,1] src_mem[0,1,2,3]\n");
+    }
+
     g_mutex_init(&lock);
 
-    /* Print configuration */
-    g_autofree gchar *config = g_strdup_printf(
-        "ChampSim Tracer Configuration:\n"
-        "  Output file: %s\n"
-        "  Skip instructions: %" PRIu64 "\n"
-        "  Trace instructions: %" PRIu64 "\n",
-        output_filename, skip_count, trace_count);
-    qemu_plugin_outs(config);
+    g_autofree gchar *cfg = g_strdup_printf(
+        "ChampSim Tracer:\n"
+        "  output: %s\n"
+        "  debug:  %s\n"
+        "  skip:   %" PRIu64 "\n"
+        "  count:  %" PRIu64 "\n",
+        output_filename,
+        debug_filename ? debug_filename : "(disabled)",
+        skip_count, trace_count);
+    qemu_plugin_outs(cfg);
 
-    /* Register translation block callback */
     qemu_plugin_register_vcpu_tb_trans_cb(id, vcpu_tb_trans);
+    qemu_plugin_register_atexit_cb(id, plugin_exit, NULL);
 
     return 0;
 }

@@ -18,7 +18,7 @@ OBJS := $(SRCS:.c=.o)
 
 .PHONY: all clean
 
-all: $(TARGET)
+all: $(TARGET) trace_dump
 
 $(TARGET): $(OBJS)
 	$(CC) $(LDFLAGS) -o $@ $^
@@ -26,8 +26,11 @@ $(TARGET): $(OBJS)
 %.o: %.c
 	$(CC) $(CFLAGS) -c -o $@ $<
 
+trace_dump: trace_dump.c
+	$(CC) -O2 -o $@ $<
+
 clean:
-	rm -f $(OBJS) $(TARGET)
+	rm -f $(OBJS) $(TARGET) trace_dump
 
 install: $(TARGET)
 	@echo "Plugin built successfully: $(TARGET)"

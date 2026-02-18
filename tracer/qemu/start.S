@@ -6,7 +6,6 @@ _start:
     call main
     j tohost_exit
 
-
 tohost_exit:
         la t0, tohost
         sw a0, 0(t0)
