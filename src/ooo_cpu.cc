@@ -830,7 +830,7 @@ void LSQ_ENTRY::finish(ooo_model_instr& rob_entry) const
 bool CacheBus::issue_read(request_type data_packet)
 {
   data_packet.address = data_packet.v_address;
-  data_packet.is_translated = false;
+  data_packet.is_translated = true; // skip TLB simulation
   data_packet.cpu = cpu;
   data_packet.type = access_type::LOAD;
 
@@ -840,7 +840,7 @@ bool CacheBus::issue_read(request_type data_packet)
 bool CacheBus::issue_write(request_type data_packet)
 {
   data_packet.address = data_packet.v_address;
-  data_packet.is_translated = false;
+  data_packet.is_translated = true; // skip TLB simulation
   data_packet.cpu = cpu;
   data_packet.type = access_type::WRITE;
   data_packet.response_requested = false;
