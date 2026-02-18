@@ -30,3 +30,8 @@ compile_commands.json
 
 .vscode/
 **/.DS_Store
+
+**/*.bin
+**/*.txt
+trace_dump
+libchampsim_tracer.so
