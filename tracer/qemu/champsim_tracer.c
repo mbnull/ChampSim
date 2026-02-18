@@ -66,6 +66,8 @@ typedef struct {
 typedef struct {
     trace_instr_format_t instr;
     uint8_t              is_conditional;
+    uint8_t              is_load;   /* 1 if this insn is a load  (opcode 0x03) */
+    uint8_t              is_store;  /* 1 if this insn is a store (opcode 0x23) */
 } insn_ctx_t;
 
 /* Global state */
@@ -203,17 +205,24 @@ static void vcpu_insn_exec(unsigned int vcpu_index, void *userdata) {
 }
 
 
-/* mem callbacks receive the same insn_ctx_t* as userdata */
-static void vcpu_mem_read(unsigned int vcpu_index, qemu_plugin_meminfo_t info,
-                          uint64_t vaddr, void *userdata) {
+/* Use QEMU's meminfo to distinguish real loads/stores from spurious callbacks.
+ * qemu_plugin_mem_is_store() returns true for writes, false for reads.
+ * We ignore the ctx->is_load/is_store flags since QEMU fires mem callbacks
+ * one instruction late in system mode — the callback for insn N fires during
+ * insn N+1's exec window, so the ctx opcode check is unreliable. */
+static void vcpu_mem_access(unsigned int vcpu_index, qemu_plugin_meminfo_t info,
+                            uint64_t vaddr, void *userdata) {
+    /* Filter out spurious callbacks with clearly invalid addresses.
+     * Real memory accesses are always above the first page (0x1000).
+     * QEMU occasionally fires mem callbacks on branch/ALU instructions
+     * in system mode with tiny vaddr values (register numbers, offsets). */
+    if (vaddr < 0x1000)
+        return;
     insn_ctx_t *ctx = (insn_ctx_t *)userdata;
-    add_mem(ctx->instr.source_memory, NUM_INSTR_SOURCES, vaddr);
-}
-
-static void vcpu_mem_write(unsigned int vcpu_index, qemu_plugin_meminfo_t info,
-                           uint64_t vaddr, void *userdata) {
-    insn_ctx_t *ctx = (insn_ctx_t *)userdata;
-    add_mem(ctx->instr.destination_memory, NUM_INSTR_DESTINATIONS, vaddr);
+    if (qemu_plugin_mem_is_store(info))
+        add_mem(ctx->instr.destination_memory, NUM_INSTR_DESTINATIONS, vaddr);
+    else
+        add_mem(ctx->instr.source_memory, NUM_INSTR_SOURCES, vaddr);
 }
 
 /* ------------------------------------------------------------------ */
@@ -275,9 +284,11 @@ static insn_ctx_t *build_insn_ctx(uint64_t pc, uint32_t insn_word) {
     } else if (opcode == 0x13 || opcode == 0x1B || opcode == 0x03 || opcode == 0x73) { /* I-type */
         add_reg(ctx->instr.source_registers, NUM_INSTR_SOURCES, map_riscv_reg(rs1));
         if (rd) add_reg(ctx->instr.destination_registers, NUM_INSTR_DESTINATIONS, map_riscv_reg(rd));
+        if (opcode == 0x03) ctx->is_load = 1;  /* load */
     } else if (opcode == 0x23) { /* S-type */
         add_reg(ctx->instr.source_registers, NUM_INSTR_SOURCES, map_riscv_reg(rs1));
         add_reg(ctx->instr.source_registers, NUM_INSTR_SOURCES, map_riscv_reg(rs2));
+        ctx->is_store = 1;
     } else if (opcode == 0x37 || opcode == 0x17) { /* U-type */
         if (rd) add_reg(ctx->instr.destination_registers, NUM_INSTR_DESTINATIONS, map_riscv_reg(rd));
     }
@@ -309,12 +320,9 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb) {
          * Only ONE vcpu_insn_exec_cb is registered — QEMU 10 drops duplicates. */
         qemu_plugin_register_vcpu_insn_exec_cb(insn, vcpu_insn_exec,
                                                QEMU_PLUGIN_CB_NO_REGS, ctx);
-        qemu_plugin_register_vcpu_mem_cb(insn, vcpu_mem_read,
+        qemu_plugin_register_vcpu_mem_cb(insn, vcpu_mem_access,
                                          QEMU_PLUGIN_CB_NO_REGS,
-                                         QEMU_PLUGIN_MEM_R, ctx);
-        qemu_plugin_register_vcpu_mem_cb(insn, vcpu_mem_write,
-                                         QEMU_PLUGIN_CB_NO_REGS,
-                                         QEMU_PLUGIN_MEM_W, ctx);
+                                         QEMU_PLUGIN_MEM_RW, ctx);
     }
 }
 
