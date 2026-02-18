@@ -92,8 +92,18 @@ static __thread uint64_t    pending_next_pc = 0;
 
 /* ------------------------------------------------------------------ */
 
+/* ChampSim magic register IDs (from inc/trace_instruction.h) */
+#define CHAMPSIM_REG_SP    6   /* REG_STACK_POINTER       */
+#define CHAMPSIM_REG_FLAGS 25  /* REG_FLAGS               */
+#define CHAMPSIM_REG_IP    26  /* REG_INSTRUCTION_POINTER */
+
+/* Map a RISC-V register number to a ChampSim register ID.
+ * x2 (sp) -> CHAMPSIM_REG_SP so ChampSim recognises call/return patterns.
+ * All others pass through as-is (1-31, avoiding 0 which means "unused"). */
 static inline uint8_t map_riscv_reg(int reg) {
-    return (reg >= 0 && reg < 32) ? (uint8_t)reg : 0;
+    if (reg == 2) return CHAMPSIM_REG_SP;
+    if (reg >= 1 && reg < 32) return (uint8_t)reg;
+    return 0;
 }
 
 static void add_reg(uint8_t *arr, size_t n, uint8_t reg) {
@@ -217,19 +227,46 @@ static insn_ctx_t *build_insn_ctx(uint64_t pc, uint32_t insn_word) {
     uint32_t rs1    = (insn_word >> 15) & 0x1F;
     uint32_t rs2    = (insn_word >> 20) & 0x1F;
 
-    if (opcode == 0x63) { /* B-type: conditional branch */
+    if (opcode == 0x63) { /* B-type: conditional branch
+                             reads_ip + reads_flags + writes_ip -> BRANCH_CONDITIONAL */
         ctx->instr.is_branch  = 1;
         ctx->is_conditional   = 1;
+        add_reg(ctx->instr.source_registers, NUM_INSTR_SOURCES, CHAMPSIM_REG_IP);
+        add_reg(ctx->instr.source_registers, NUM_INSTR_SOURCES, CHAMPSIM_REG_FLAGS);
+        add_reg(ctx->instr.destination_registers, NUM_INSTR_DESTINATIONS, CHAMPSIM_REG_IP);
+        /* also record the actual RISC-V source regs for completeness */
         add_reg(ctx->instr.source_registers, NUM_INSTR_SOURCES, map_riscv_reg(rs1));
         add_reg(ctx->instr.source_registers, NUM_INSTR_SOURCES, map_riscv_reg(rs2));
-    } else if (opcode == 0x6F) { /* JAL */
+    } else if (opcode == 0x6F) { /* JAL
+                                    writes_ip, no reads_sp/flags -> BRANCH_DIRECT_JUMP
+                                    if rd==x1/x5 (link reg) treat as BRANCH_DIRECT_CALL */
         ctx->instr.is_branch   = 1;
         ctx->instr.branch_taken = 1;
+        add_reg(ctx->instr.destination_registers, NUM_INSTR_DESTINATIONS, CHAMPSIM_REG_IP);
+        if (rd == 1 || rd == 5) { /* ra or t0 = link register -> call */
+            add_reg(ctx->instr.source_registers,      NUM_INSTR_SOURCES,      CHAMPSIM_REG_IP);
+            add_reg(ctx->instr.source_registers,      NUM_INSTR_SOURCES,      CHAMPSIM_REG_SP);
+            add_reg(ctx->instr.destination_registers, NUM_INSTR_DESTINATIONS, CHAMPSIM_REG_SP);
+        }
         if (rd) add_reg(ctx->instr.destination_registers, NUM_INSTR_DESTINATIONS, map_riscv_reg(rd));
-    } else if (opcode == 0x67) { /* JALR */
+    } else if (opcode == 0x67) { /* JALR
+                                    rs1==x1/x5 && rd==x0 -> BRANCH_RETURN
+                                    rd==x1/x5             -> BRANCH_INDIRECT_CALL
+                                    otherwise             -> BRANCH_INDIRECT */
         ctx->instr.is_branch   = 1;
         ctx->instr.branch_taken = 1;
-        add_reg(ctx->instr.source_registers, NUM_INSTR_SOURCES, map_riscv_reg(rs1));
+        add_reg(ctx->instr.destination_registers, NUM_INSTR_DESTINATIONS, CHAMPSIM_REG_IP);
+        if ((rs1 == 1 || rs1 == 5) && rd == 0) { /* ret */
+            add_reg(ctx->instr.source_registers,      NUM_INSTR_SOURCES,      CHAMPSIM_REG_SP);
+            add_reg(ctx->instr.destination_registers, NUM_INSTR_DESTINATIONS, CHAMPSIM_REG_SP);
+        } else if (rd == 1 || rd == 5) { /* indirect call */
+            add_reg(ctx->instr.source_registers,      NUM_INSTR_SOURCES,      CHAMPSIM_REG_IP);
+            add_reg(ctx->instr.source_registers,      NUM_INSTR_SOURCES,      CHAMPSIM_REG_SP);
+            add_reg(ctx->instr.destination_registers, NUM_INSTR_DESTINATIONS, CHAMPSIM_REG_SP);
+            add_reg(ctx->instr.source_registers,      NUM_INSTR_SOURCES,      map_riscv_reg(rs1));
+        } else { /* indirect jump */
+            add_reg(ctx->instr.source_registers, NUM_INSTR_SOURCES, map_riscv_reg(rs1));
+        }
         if (rd) add_reg(ctx->instr.destination_registers, NUM_INSTR_DESTINATIONS, map_riscv_reg(rd));
     } else if (opcode == 0x33 || opcode == 0x3B) { /* R-type */
         add_reg(ctx->instr.source_registers, NUM_INSTR_SOURCES, map_riscv_reg(rs1));
