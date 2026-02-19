@@ -227,6 +227,7 @@ class NormalizedConfiguration:
         ''' Normalize a JSON configuration in preparation for parsing '''
         # Copy or trim cores as necessary to fill out the specified number of cores
         self.cores = duplicate_to_length(config_file.get('ooo_cpu', [{}]), config_file.get('num_cores', 1))
+        self.cpu_model = config_file.get('cpu_model', 'ooo')
 
         # Default core elements
         core_from_config = util.subdict(config_file,
@@ -304,6 +305,8 @@ class NormalizedConfiguration:
         self.pmem = util.chain(self.pmem, rhs.pmem)
         self.vmem = util.chain(self.vmem, rhs.vmem)
         self.root = util.chain(self.root, rhs.root)
+        if rhs.cpu_model != 'ooo':
+            self.cpu_model = rhs.cpu_model
 
     def apply_defaults_in(self, branch_context, btb_context, prefetcher_context, replacement_context, verbose=False):
         ''' Apply defaults and produce a result suitible for writing the generated files. '''
@@ -445,7 +448,8 @@ class NormalizedConfiguration:
 
         config_extern = {
             **util.subdict(root_config, ('block_size', 'page_size', 'heartbeat_frequency')),
-            'num_cores': len(cores)
+            'num_cores': len(cores),
+            'cpu_model': self.cpu_model
         }
 
         return elements, module_info, config_extern

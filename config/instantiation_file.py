@@ -312,7 +312,7 @@ def decorate_queues(caches, ptws, pmem):
 def get_queue_info(ul_pairs, decoration):
     return [decoration.get(ll) for ll,_ in ul_pairs]
 
-def get_instantiation_lines(cores, caches, ptws, pmem, vmem, build_id):
+def get_instantiation_lines(cores, caches, ptws, pmem, vmem, build_id, cpu_model='ooo'):
     '''
     Generate the lines for a C++ file that instantiates a configuration.
     '''
@@ -374,9 +374,11 @@ def get_instantiation_lines(cores, caches, ptws, pmem, vmem, build_id):
         '},'
     )
 
+    cpu_class = 'InOrderCPU' if cpu_model == 'inorder' else 'O3_CPU'
+
     core_instantiation_body = (
         'cores {',
-        *get_builder_function_call('O3_CPU',
+        *get_builder_function_call(cpu_class,
                                    map(functools.partial(get_cpu_builder, caches=caches, ul_pairs=ul_pairs), cores)),
         '}'
     )
@@ -394,7 +396,15 @@ def get_instantiation_lines(cores, caches, ptws, pmem, vmem, build_id):
     yield '}'
     yield ''
 
-    yield from get_ref_vector_function('O3_CPU', f'{classname}::cpu_view', 'cores')
+    if cpu_model == 'inorder':
+        yield from cxx.function(f'{classname}::cpu_view', (
+            'std::vector<std::reference_wrapper<O3_CPU>> retval{};',
+            'auto make_ref = [](auto& x){ return std::ref<O3_CPU>(x); };',
+            'std::transform(std::begin(cores), std::end(cores), std::back_inserter(retval), make_ref);',
+            'return retval;'
+        ), rtype='std::vector<std::reference_wrapper<O3_CPU>>')
+    else:
+        yield from get_ref_vector_function('O3_CPU', f'{classname}::cpu_view', 'cores')
     yield ''
 
     yield from get_ref_vector_function('CACHE', f'{classname}::cache_view', 'caches')
@@ -418,9 +428,14 @@ def get_instantiation_lines(cores, caches, ptws, pmem, vmem, build_id):
     yield ''
 
 def get_instantiation_header(num_cpus, env, build_id):
+    cpu_model = env.get('cpu_model', 'ooo')
+    cpu_class = 'InOrderCPU' if cpu_model == 'inorder' else 'O3_CPU'
+
     yield '#include "environment.h"'
     yield '#include "vmem.h"'
     yield '#include <forward_list>'
+    if cpu_model == 'inorder':
+        yield '#include "inorder_cpu.h"'
     yield 'template <>'
     struct_body = (
         'private:',
@@ -429,7 +444,7 @@ def get_instantiation_header(num_cpus, env, build_id):
         'VirtualMemory vmem;',
         'std::forward_list<PageTableWalker> ptws;',
         'std::forward_list<CACHE> caches;',
-        'std::forward_list<O3_CPU> cores;',
+        f'std::forward_list<{cpu_class}> cores;',
 
         'public:',
         f'constexpr static std::size_t num_cpus = {num_cpus};',

@@ -165,7 +165,7 @@ class Fragment:
         fileparts = [
             # Instantiation file
             (os.path.join(objdir_name, 'core_inst.inc'), cxx_file(get_instantiation_header(len(elements['cores']), config_file, build_id=build_id))),
-            (os.path.join(objdir_name, 'core_inst.cc.inc'), cxx_file(get_instantiation_lines(build_id=build_id, **elements))),
+            (os.path.join(objdir_name, 'core_inst.cc.inc'), cxx_file(get_instantiation_lines(build_id=build_id, cpu_model=config_file.get('cpu_model', 'ooo'), **elements))),
 
             # Makefile generation
             (os.path.join(makedir_name, '_configuration.mk'), (

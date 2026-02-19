@@ -145,10 +145,10 @@ public:
   CacheBus L1I_bus, L1D_bus;
   CACHE* l1i;
 
-  void initialize() final;
-  long operate() final;
-  void begin_phase() final;
-  void end_phase(unsigned cpu) final;
+  void initialize() override;
+  long operate() override;
+  void begin_phase() override;
+  void end_phase(unsigned cpu) override;
 
   void initialize_instruction();
   long check_dib();
@@ -183,7 +183,7 @@ public:
   [[nodiscard]] auto sim_instr() const { return num_retired - begin_phase_instr; }
   [[nodiscard]] auto sim_cycle() const { return (current_time.time_since_epoch() / clock_period) - sim_stats.begin_cycles; }
 
-  void print_deadlock() final;
+  void print_deadlock() override;
 
 #include "module_decl.inc"
 
