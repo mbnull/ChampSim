@@ -18,7 +18,7 @@ OBJS := $(SRCS:.c=.o)
 
 .PHONY: all clean
 
-all: $(TARGET) trace_dump
+all: $(TARGET) trace_dump librv32m_count.so
 
 $(TARGET): $(OBJS)
 	$(CC) $(LDFLAGS) -o $@ $^
@@ -29,8 +29,11 @@ $(TARGET): $(OBJS)
 trace_dump: trace_dump.c
 	$(CC) -O2 -o $@ $<
 
+librv32m_count.so: rv32m_count.c
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $<
+
 clean:
-	rm -f $(OBJS) $(TARGET) trace_dump
+	rm -f $(OBJS) $(TARGET) trace_dump librv32m_count.so
 
 install: $(TARGET)
 	@echo "Plugin built successfully: $(TARGET)"
