@@ -34,4 +34,6 @@ compile_commands.json
 **/*.bin
 **/*.txt
 trace_dump
-libchampsim_tracer.so
+
+*.so
+results/
