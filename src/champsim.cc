@@ -78,7 +78,7 @@ phase_stats do_phase(const phase_info& phase, environment& env, std::vector<trac
   uint64_t livelock_period{10000000};
   uint64_t livelock_timer{0};
   //                                   die | critical | warning
-  std::vector<double> livelock_threshold{0.01, 0.02, 0.05};
+  std::vector<double> livelock_threshold{0.00, 0.02, 0.05};
   std::vector<uint64_t> livelock_instr(std::size(env.cpu_view()), 0);
 
   // Perform phase
@@ -97,7 +97,9 @@ phase_stats do_phase(const phase_info& phase, environment& env, std::vector<trac
     }
 
     // Livelock detect, every livelock_period cycles, check progress and alert the user
-    livelock_timer++;
+    // info: disable livelock and dead lock detect
+    livelock_timer++; 
+    stalled_cycle = 0;
     if (livelock_timer >= livelock_period) {
       // for each cpu
       for (O3_CPU& cpu : env.cpu_view()) {
