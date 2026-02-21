@@ -107,6 +107,10 @@ long MEMORY_CONTROLLER::operate()
 long DRAM_CHANNEL::operate()
 {
   long progress{0};
+  // 100 MHz CPU: 1 cycle = 10000 ps
+  constexpr long CPU_PERIOD_PS = 10000;
+  constexpr long FIXED_HIT_LATENCY = 10 * CPU_PERIOD_PS;
+  constexpr long FIXED_MISS_LATENCY = 50 * CPU_PERIOD_PS;
 
   if (warmup) {
     for (auto& entry : RQ) {
@@ -131,11 +135,41 @@ long DRAM_CHANNEL::operate()
 
   check_write_collision();
   check_read_collision();
-  progress += finish_dbus_request();
-  swap_write_mode();
-  progress += schedule_refresh();
-  progress += populate_dbus();
-  progress += service_packet(schedule_packet());
+
+  auto process_queue = [&](queue_type& queue, bool is_read) {
+    for (auto& entry : queue) {
+      if (!entry.has_value())
+        continue;
+
+      if (!entry->scheduled) {
+        auto op_row = address_mapping.get_row(entry->address);
+        auto op_idx = bank_request_index(entry->address);
+        bool hit = bank_request[op_idx].open_row.has_value() && *bank_request[op_idx].open_row == op_row;
+
+        entry->ready_time = current_time + champsim::chrono::clock::duration{hit ? FIXED_HIT_LATENCY : FIXED_MISS_LATENCY};
+        entry->scheduled = true;
+        bank_request[op_idx].open_row = op_row;
+
+        if (is_read)
+          ++(hit ? sim_stats.RQ_ROW_BUFFER_HIT : sim_stats.RQ_ROW_BUFFER_MISS);
+        else
+          ++(hit ? sim_stats.WQ_ROW_BUFFER_HIT : sim_stats.WQ_ROW_BUFFER_MISS);
+      }
+
+      if (entry->scheduled && entry->ready_time <= current_time) {
+        if (is_read) {
+          response_type response{entry->address, entry->v_address, entry->data, entry->pf_metadata, entry->instr_depend_on_me};
+          for (auto* ret : entry->to_return)
+            ret->push_back(response);
+        }
+        entry.reset();
+        ++progress;
+      }
+    }
+  };
+
+  process_queue(RQ, true);
+  process_queue(WQ, false);
 
   return progress;
 }
